@@ -1,0 +1,133 @@
+## Mopsgeschwindigkeit
+
+Der Code in `slow-sim.R` implementiert eine (relativ sinnbefreite) Simulationsstudie um die Verteilung der geschätzten Regressionskoeffizienten $\hat\beta$ in einem Modell 
+$y \sim t(\text{ncp}= X \beta, \text{df}=4)$ mit $t(4)$-verteilten Fehlern und
+linearem Prädiktor $X \beta$ zu bestimmen:
+```{r, slow_sim}
+source("slow-sim.R")
+
+set.seed <- 232323
+observations <- 5000
+covariates <- 10
+testdata <- as.data.frame(
+  matrix(rnorm(observations * covariates),
+    nrow = observations
+  )
+)
+
+test <- simulate(reps = 100, seed = 20141028, data = testdata)
+system.time(test <- simulate(reps = 100, seed = 20141028, data = testdata))
+```
+Die Simulation ist recht ineffizient programmiert.
+
+a) Benutzen Sie die in der Vorlesung kennengelernten Profiling-Methoden um die Stellen zu identifizieren an denen das Skript in `slow-sim.R` die meiste Zeit verbringt. 
+b) Modifizieren Sie den Code in `slow-sim.R` so, dass er i) **mindestens 5x schneller** läuft (ohne dass sich die Ergebnisse qualitativ ändern!!) und ii) unseren Vorstellungen von sauber dokumentierter, gut strukturierter und defensiv programmierter Software entspricht.
+
+*Hinweis:* Betrachten Sie zu a) sowohl wo in dem Code von `slow-sim.R`  die meiste Zeit verbraucht wird als auch welche *eingebauten* R-Funktionen dort aufgerufen werden und was diese tun und wie.  
+Für b) sollten Sie sich zuerst mal überlegen was man hier eigentlich tun will ("First, solve the problem. Then, write the code.") um dann kritisch auf den Code zu gucken: Wo tut er mehr als er eigentlich muss? Wo wiederholt sich Schritte überflüssigerweise? Können Sie Berechnungen vektorisieren oder Zuweisungen prä-allozieren?  
+Wenn Sie den Code in b) schön effizient gemacht haben versuchen Sie auch noch ihn (möglichst: plattformunabhängig) zu parallelisieren, mit einem Paket Ihrer Wahl. (Obacht: `future` funktioniert nicht unbedingt verläßlich in RStudio, benutzen Sie da zum Testen eine normale R-Konsole....)
+
+### zu a)
+```{r, profile, eval=FALSE}
+profvis::profvis(test <- simulate(reps = 100, seed = 20141028, data = testdata))
+```
+Die meiste Zeit wird innerhalb der For-Schleife verbracht.
+Sowohl die Simulation der y-Daten als auch die Schätzung der Koeffizienten
+ist zeitaufwändig. Bei der Schätzung ist es die lm-Funktion, die zeitaufwändig
+ ist.
+
+### zu b) ohne Parallelisierung
+```{r, sim_fast}
+# This function repeatedly simulates coefficients of linear models for
+# t-distributed responses using the hat matrix.
+# Input: number of repetitions, seed, dataframe of numeric independent
+# variables, degrees of freedom
+# Output: matrix of coefficients for each repetition as columns
+simulate_fast <- function(reps, seed, data, true_coefs = 0:ncol(data), df = 4) {
+  ## check input data
+  checkmate::assert_count(reps, positive = TRUE)
+  checkmate::assert_count(seed) 
+  checkmate::assert_data_frame(data, types = "numeric", any.missing = FALSE)
+  checkmate::assert_count(df, positive = TRUE)
+  ####################
+
+  set.seed(seed)
+  design <- model.matrix(~., data = data)
+  hat_matrix <- solve(t(design) %*% design) %*% t(design)
+  responses <- simulate_responses_fast(
+    reps = reps, design = design, true_coefs = true_coefs, df = df
+  )
+  coefs <- apply(responses, 2, function(y) {
+    hat_matrix %*% y
+  })
+  structure(coefs, seed = seed)
+}
+
+# This function repeatedly simulates the response variable by adding
+# t-distributed noises to the expected response value.
+# Input: number of repetitions, design matrix, true coefficients,
+# degrees of freedom
+# Output: matrix of response variables for each repetition as columns
+simulate_responses_fast <- function(reps, design, true_coefs, df) {
+  expected <- design %*% true_coefs
+  matrix(
+    rep(expected, reps) + rt(nrow(design) * reps, df = df),
+    nrow = nrow(design),
+    byrow = FALSE
+  )
+}
+```
+
+### zu b) mit Paralellisierung (future-package)
+```{r, b_parallel}
+# This function repeatedly simulates coefficients of linear models for
+# t-distributed responses using the hat matrix (supports parallel computing).
+# Input: number of repetitions, seed, dataframe of numeric independent
+# variables, degrees of freedom
+# Output: matrix of coefficients for each repetition as columns
+simulate_parallel <- function(reps, seed, data, true_coefs = 0:ncol(data), df = 4) {
+  old_plan <- future::plan()
+  on.exit(future::plan(old_plan))
+  future::plan("multiprocess", workers = 3)
+  ## check input data
+  checkmate::assert_count(reps, positive = TRUE)
+  checkmate::assert_count(seed) # is negative also possible?
+  checkmate::assert_data_frame(data, types = "numeric", any.missing = FALSE)
+  checkmate::assert_count(df, positive = TRUE)
+  ####################
+
+  set.seed(seed)
+  design <- model.matrix(~., data = data)
+  hat_matrix <- solve(t(design) %*% design) %*% t(design)
+  responses <- simulate_responses_fast(
+    reps = reps, design = design, true_coefs = true_coefs, df = df
+  )
+  coefs <- future.apply::future_apply(responses, 2, function(y) {
+    hat_matrix %*% y
+  })
+  structure(coefs, seed = seed)
+}
+```
+
+### Benchmark
+```{r, benchmark}
+reps <- 100
+seed <- 20141028
+data <- testdata
+# rbenchmark::benchmark(
+#   slow = simulate(reps = reps, seed = seed, data = data),
+#   fast = simulate_fast(reps = reps, seed = seed, data = data),
+#   fast_parallel = simulate_parallel(reps = reps, seed = seed, data = data),
+#   replications = 100,
+#   columns = c("test", "elapsed", "relative"),
+#   order = "elapsed"
+# )
+bench::mark(
+  slow = simulate(reps = reps, seed = seed, data = data),
+  fast = simulate_fast(reps = reps, seed = seed, data = data),
+  fast_parallel = simulate_parallel(reps = reps, seed = seed, data = data),
+  memory = FALSE
+)
+```
+Die Parallelisierung scheint sich in diesem Fall nicht zu lohnen, vermutlich
+aufgrund von zu hohem Overhead.
